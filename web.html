@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#090d18">
+  <title>Jarvis | Personal AI</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #090d18;
+      color: #eef3ff;
+      font-synthesis: none;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(ellipse at 50% 16%, #18264a 0, transparent 42%),
+        #090d18;
+    }
+    button, textarea { font: inherit; }
+    .app { display: flex; min-height: 100vh; flex-direction: column; }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 22px clamp(20px, 5vw, 72px);
+      border-bottom: 1px solid #ffffff12;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; font-size: 15px; font-weight: 650; letter-spacing: .12em; }
+    .brand-mark {
+      display: grid;
+      width: 34px;
+      height: 34px;
+      place-items: center;
+      border: 1px solid #65d7ff77;
+      border-radius: 50%;
+      color: #7ee3ff;
+      box-shadow: 0 0 22px #41caff22;
+    }
+    .online { color: #9baac6; font-size: 12px; }
+    .online::before { display: inline-block; width: 7px; height: 7px; margin-right: 8px; border-radius: 50%; background: #64e6bd; content: ""; }
+    main { display: flex; width: min(100% - 32px, 820px); flex: 1; flex-direction: column; align-items: center; margin: 0 auto; }
+    .hero { display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; min-height: 310px; padding: 34px 0 20px; text-align: center; }
+    .orb {
+      position: relative;
+      display: grid;
+      width: 126px;
+      height: 126px;
+      place-items: center;
+      border: 1px solid #67ceff66;
+      border-radius: 50%;
+      background: radial-gradient(circle at 36% 30%, #4f8fc466, #182f5c 43%, #111a30 72%);
+      box-shadow: 0 0 32px #36b9ff33, inset 0 0 30px #67d9ff22;
+    }
+    .orb::before, .orb::after { position: absolute; border: 1px solid #64d4ff35; border-radius: 50%; content: ""; }
+    .orb::before { inset: -12px; }
+    .orb::after { inset: -23px; border-color: #64d4ff20; }
+    .orb.listening { animation: pulse 1.25s ease-in-out infinite alternate; }
+    @keyframes pulse { to { box-shadow: 0 0 52px #36b9ff99, inset 0 0 35px #67d9ff55; transform: scale(1.045); } }
+    .orb svg { width: 43px; color: #a7edff; }
+    h1 { margin: 30px 0 8px; font-size: clamp(28px, 5vw, 38px); font-weight: 550; letter-spacing: -.035em; }
+    .subtitle { margin: 0; color: #9aa8c2; font-size: 14px; }
+    .conversation { display: flex; width: 100%; flex-direction: column; gap: 15px; padding: 4px 0 24px; }
+    .message { max-width: min(88%, 650px); padding: 13px 16px; border: 1px solid #ffffff12; border-radius: 17px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .message.user { align-self: flex-end; border-color: #56caff35; background: #18304a; }
+    .message.assistant { align-self: flex-start; background: #121a2a; }
+    .message.error { align-self: center; border-color: #ff718055; color: #ffb5bc; font-size: 13px; }
+    .composer { width: 100%; padding: 0 0 28px; }
+    .input-wrap { display: flex; align-items: flex-end; gap: 10px; padding: 10px; border: 1px solid #ffffff20; border-radius: 21px; background: #111827e8; box-shadow: 0 14px 45px #0005; }
+    textarea { width: 100%; min-height: 46px; max-height: 150px; resize: vertical; padding: 13px 10px; border: 0; outline: 0; background: transparent; color: #eef3ff; line-height: 1.4; }
+    textarea::placeholder { color: #77839b; }
+    .icon-button { display: grid; width: 46px; height: 46px; flex: 0 0 auto; place-items: center; border: 1px solid #ffffff1c; border-radius: 15px; background: #ffffff08; color: #b9c9e5; cursor: pointer; transition: .18s ease; }
+    .icon-button:hover { border-color: #5ecfff80; background: #2f9bc526; color: #a6edff; }
+    .icon-button:disabled { cursor: wait; opacity: .48; }
+    .icon-button svg { width: 20px; height: 20px; }
+    #mic.recording { border-color: #ff718088; background: #c8364528; color: #ff9ba4; }
+    #send { border-color: #4abef755; background: #177aaa; color: white; }
+    #send:hover { background: #2197c9; }
+    .footnote { margin: 12px 0 0; color: #71809b; font-size: 11px; text-align: center; }
+    .status { min-height: 18px; margin: 11px 4px 0; color: #8bdcf5; font-size: 12px; text-align: center; }
+    @media (max-height: 700px) { .hero { min-height: 250px; } .orb { width: 96px; height: 96px; } h1 { margin-top: 24px; } }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="brand"><span class="brand-mark" aria-hidden="true">J</span><span>JARVIS</span></div>
+      <div class="online">Local assistant</div>
+    </header>
+    <main>
+      <section class="hero" aria-label="Jarvis assistant">
+        <div class="orb" id="orb" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3">
+            <path d="M12 3v18M3 12h18M5.64 5.64l12.72 12.72m0-12.72L5.64 18.36" />
+            <circle cx="12" cy="12" r="5.2" />
+          </svg>
+        </div>
+        <h1>Good to see you.</h1>
+        <p class="subtitle">I’m listening. What can I help you with?</p>
+      </section>
+      <section class="conversation" id="conversation" aria-live="polite" aria-label="Conversation"></section>
+      <form class="composer" id="composer">
+        <div class="input-wrap">
+          <textarea id="prompt" rows="1" aria-label="Message Jarvis" placeholder="Ask Jarvis anything…"></textarea>
+          <button class="icon-button" id="mic" type="button" aria-label="Speak to Jarvis" title="Speak to Jarvis">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="2.5" width="6" height="12" rx="3" /><path d="M5 11.5a7 7 0 0 0 14 0M12 18.5v3m-4 0h8" />
+            </svg>
+          </button>
+          <button class="icon-button" id="send" type="submit" aria-label="Send message" title="Send message">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m21 3-7.2 18-3.9-7.9L2 9.2 21 3Z" /><path d="M21 3 9.9 13.1" />
+            </svg>
+          </button>
+        </div>
+        <div class="status" id="status" role="status">Type a message or use the microphone.</div>
+        <p class="footnote">Powered by your local Ollama model · Enter to send</p>
+      </form>
+    </main>
+  </div>
+  <script>
+    const form = document.querySelector("#composer");
+    const input = document.querySelector("#prompt");
+    const conversationEl = document.querySelector("#conversation");
+    const statusEl = document.querySelector("#status");
+    const micButton = document.querySelector("#mic");
+    const sendButton = document.querySelector("#send");
+    const orb = document.querySelector("#orb");
+    const history = [];
+    let busy = false;
+    let recording = false;
+    let audioStream;
+    let audioContext;
+    let audioSource;
+    let audioProcessor;
+    let muteGain;
+    let audioChunks = [];
+    let recordingTimer;
+
+    function addMessage(role, text, extraClass = "") {
+      const message = document.createElement("div");
+      message.className = `message ${role} ${extraClass}`.trim();
+      message.textContent = text;
+      conversationEl.append(message);
+      message.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      return message;
+    }
+
+    function setBusy(value) {
+      busy = value;
+      input.disabled = value;
+      sendButton.disabled = value;
+      micButton.disabled = value;
+      orb.classList.toggle("listening", value);
+    }
+
+    async function sendMessage(text) {
+      const prompt = text.trim();
+      if (!prompt || busy) return;
+      addMessage("user", prompt);
+      input.value = "";
+      setBusy(true);
+      statusEl.textContent = "Jarvis is responding…";
+      const answerBubble = addMessage("assistant", "");
+      let answer = "";
+      try {
+        const response = await fetch("/api/chat/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ prompt, history })
+        });
+        if (!response.ok || !response.body) {
+          const data = await response.json();
+          throw new Error(data.error || `Request failed (${response.status}).`);
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffered = "";
+        let finished = false;
+        while (!finished) {
+          const { value, done } = await reader.read();
+          buffered += decoder.decode(value, { stream: !done });
+          let boundary = buffered.indexOf("\n\n");
+          while (boundary !== -1) {
+            const event = buffered.slice(0, boundary);
+            buffered = buffered.slice(boundary + 2);
+            const dataLine = event.split("\n").find((line) => line.startsWith("data:"));
+            if (dataLine) {
+              const data = JSON.parse(dataLine.slice(5).trim());
+              if (data.error) throw new Error(data.error);
+              if (typeof data.token === "string") {
+                answer += data.token;
+                answerBubble.textContent = answer;
+                answerBubble.scrollIntoView({ behavior: "smooth", block: "nearest" });
+              }
+              if (data.done) finished = true;
+            }
+            boundary = buffered.indexOf("\n\n");
+          }
+          if (done) break;
+        }
+        if (!answer) throw new Error("Jarvis returned an empty response.");
+        history.push({ role: "user", content: prompt }, { role: "assistant", content: answer });
+        if ("speechSynthesis" in window && typeof SpeechSynthesisUtterance !== "undefined") {
+          window.speechSynthesis.cancel();
+          window.speechSynthesis.speak(new SpeechSynthesisUtterance(answer));
+        }
+        statusEl.textContent = "Ready when you are.";
+      } catch (error) {
+        answerBubble.classList.add("error");
+        answerBubble.textContent = error instanceof Error ? error.message : String(error);
+        statusEl.textContent = "Could not reach Jarvis.";
+      } finally {
+        setBusy(false);
+        input.focus();
+      }
+    }
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      sendMessage(input.value);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        form.requestSubmit();
+      }
+    });
+
+    async function transcribeAudio(pcm) {
+      try {
+        statusEl.textContent = "Transcribing your voice locally…";
+        const response = await fetch("/api/transcribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream", "X-Audio-Sample-Rate": "16000" },
+          body: pcm
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || `Transcription failed (${response.status}).`);
+        if (!result.text) {
+          statusEl.textContent = "I didn’t catch that. Click the microphone and try again.";
+          return;
+        }
+        input.value = result.text;
+        await sendMessage(result.text);
+      } catch (error) {
+        statusEl.textContent = error instanceof Error ? error.message : String(error);
+      } finally {
+        micButton.disabled = false;
+        input.disabled = false;
+        sendButton.disabled = false;
+        orb.classList.remove("listening");
+        input.focus();
+      }
+    }
+
+    async function finishRecording() {
+      if (!recording) return;
+      recording = false;
+      clearTimeout(recordingTimer);
+      statusEl.textContent = "Finishing recording…";
+      micButton.classList.remove("recording");
+      micButton.setAttribute("aria-label", "Speak to Jarvis");
+      micButton.title = "Speak to Jarvis";
+      micButton.disabled = true;
+      audioProcessor?.disconnect();
+      audioSource?.disconnect();
+      muteGain?.disconnect();
+      audioStream?.getTracks().forEach((track) => track.stop());
+      audioStream = undefined;
+      audioProcessor = undefined;
+      audioSource = undefined;
+      muteGain = undefined;
+      const context = audioContext;
+      audioContext = undefined;
+
+      try {
+        if (context && context.state !== "closed") await context.close();
+        const totalSamples = audioChunks.reduce((total, chunk) => total + chunk.length, 0);
+        if (!totalSamples) throw new Error("No microphone audio was captured. Check your microphone and try again.");
+        const samples = new Float32Array(totalSamples);
+        let offset = 0;
+        for (const chunk of audioChunks) {
+          samples.set(chunk, offset);
+          offset += chunk.length;
+        }
+        audioChunks = [];
+        const ratio = context.sampleRate / 16000;
+        const sampleCount = Math.floor(samples.length / ratio);
+        if (!sampleCount) throw new Error("The recording was too short. Please try again.");
+        const pcm = new Int16Array(sampleCount);
+        for (let i = 0; i < sampleCount; i++) {
+          const sourceIndex = i * ratio;
+          const low = Math.floor(sourceIndex);
+          const fraction = sourceIndex - low;
+          const sample = samples[low] * (1 - fraction) + samples[Math.min(low + 1, samples.length - 1)] * fraction;
+          pcm[i] = Math.max(-1, Math.min(1, sample)) * 32767;
+        }
+        await transcribeAudio(pcm);
+      } catch (error) {
+        statusEl.textContent = error instanceof Error ? error.message : String(error);
+        micButton.disabled = false;
+        input.disabled = false;
+        sendButton.disabled = false;
+      } finally {
+        orb.classList.remove("listening");
+      }
+    }
+
+    micButton.addEventListener("click", async () => {
+      if (recording) {
+        await finishRecording();
+        return;
+      }
+      if (busy) return;
+      if (!navigator.mediaDevices?.getUserMedia || typeof AudioContext === "undefined") {
+        statusEl.textContent = "This browser cannot capture microphone audio. Try a recent version of Chrome or Edge.";
+        return;
+      }
+      try {
+        micButton.disabled = true;
+        statusEl.textContent = "Allow microphone access to start recording…";
+        audioStream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        });
+        audioContext = new AudioContext();
+        if (audioContext.state === "suspended") await audioContext.resume();
+        audioSource = audioContext.createMediaStreamSource(audioStream);
+        audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+        muteGain = audioContext.createGain();
+        muteGain.gain.value = 0;
+        audioProcessor.onaudioprocess = (event) => {
+          if (recording) audioChunks.push(event.inputBuffer.getChannelData(0).slice());
+        };
+        audioSource.connect(audioProcessor);
+        audioProcessor.connect(muteGain);
+        muteGain.connect(audioContext.destination);
+        audioChunks = [];
+        recording = true;
+        micButton.disabled = false;
+        micButton.classList.add("recording");
+        micButton.setAttribute("aria-label", "Stop recording and send");
+        micButton.title = "Stop recording and send";
+        orb.classList.add("listening");
+        statusEl.textContent = "Recording… click the microphone again when you’re done.";
+        recordingTimer = setTimeout(finishRecording, 30000);
+      } catch (error) {
+        audioStream?.getTracks().forEach((track) => track.stop());
+        audioStream = undefined;
+        if (audioContext && audioContext.state !== "closed") await audioContext.close();
+        audioContext = undefined;
+        micButton.disabled = false;
+        const message = error instanceof Error ? error.message : String(error);
+        statusEl.textContent = error instanceof DOMException && error.name === "NotAllowedError"
+          ? "Microphone access was denied. Allow microphone access for this page in your browser settings."
+          : error instanceof DOMException && error.name === "NotFoundError"
+            ? "No microphone was found. Connect or enable a microphone and try again."
+            : `Could not start microphone recording: ${message}`;
+        orb.classList.remove("listening");
+        micButton.classList.remove("recording");
+        micButton.setAttribute("aria-label", "Speak to Jarvis");
+        micButton.title = "Speak to Jarvis";
+      }
+    });
+  </script>
+</body>
+</html>

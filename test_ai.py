@@ -2,7 +2,10 @@ import io
 import json
 import os
 import tempfile
+import threading
 import unittest
+from http.client import HTTPConnection
+from http.server import ThreadingHTTPServer
 from types import ModuleType
 from unittest.mock import MagicMock, patch
 from urllib.error import URLError
@@ -42,6 +45,30 @@ class OllamaResponseTests(unittest.TestCase):
         self.assertEqual(payload["messages"][-2]["content"], "previous turn")
         self.assertEqual(payload["messages"][-1]["content"], "hello")
 
+    @patch("ai.urlopen")
+    def test_streaming_response_yields_generated_chunks(
+        self, mock_urlopen: MagicMock
+    ) -> None:
+        response = MagicMock()
+        response.__enter__.return_value.__iter__.return_value = iter(
+            [
+                b'{"message":{"content":"Hello "},"done":false}\n',
+                b'{"message":{"content":"there"},"done":false}\n',
+                b'{"message":{"content":""},"done":true}\n',
+            ]
+        )
+        mock_urlopen.return_value = response
+
+        result = list(
+            ai.ollama_response_chunks(
+                "hello", model="test-model", history=[]
+            )
+        )
+
+        self.assertEqual(result, ["Hello ", "there"])
+        payload = json.loads(mock_urlopen.call_args.args[0].data)
+        self.assertTrue(payload["stream"])
+
     @patch("ai.urlopen", side_effect=URLError("connection refused"))
     def test_connection_failure_is_reported(self, mock_urlopen: MagicMock) -> None:
         with self.assertRaisesRegex(ai.OllamaError, "Could not reach Ollama"):
@@ -79,6 +106,21 @@ class CommandLineTests(unittest.TestCase):
     def test_normalizes_prompt(self) -> None:
         self.assertEqual(ai.normalize_prompt("  hello \n   there  "), "hello there")
 
+    @patch("ai.serve_web_app", return_value=0)
+    def test_web_flag_starts_browser_interface(self, mock_web: MagicMock) -> None:
+        result = ai.main(["--web", "--model", "llama3.2", "--port", "9000"])
+
+        self.assertEqual(result, 0)
+        mock_web.assert_called_once_with(
+            model="llama3.2", host=ai.DEFAULT_HOST, port=9000
+        )
+
+    def test_web_flag_rejects_prompt(self) -> None:
+        with self.assertRaises(SystemExit) as exit_info:
+            ai.main(["--web", "hello"])
+
+        self.assertEqual(exit_info.exception.code, 2)
+
     @patch("ai.interactive_chat", return_value=0)
     def test_voice_flag_starts_voice_chat(self, mock_interactive: MagicMock) -> None:
         result = ai.main(["--voice", "--model", "llama3.2"])
@@ -87,6 +129,139 @@ class CommandLineTests(unittest.TestCase):
         mock_interactive.assert_called_once_with(
             model="llama3.2", host=ai.DEFAULT_HOST, voice=True
         )
+
+
+class WebInterfaceTests(unittest.TestCase):
+    @patch(
+        "ai.ollama_response_chunks",
+        return_value=iter(["Hello ", "streaming"]),
+    )
+    @patch("ai.ollama_response", return_value="Hello from Jarvis")
+    @patch("ai.webbrowser.open", return_value=True)
+    def test_web_page_and_chat_endpoint(
+        self,
+        mock_browser: MagicMock,
+        mock_response: MagicMock,
+        mock_response_chunks: MagicMock,
+    ) -> None:
+        original_server = ThreadingHTTPServer
+        servers: list[ThreadingHTTPServer] = []
+        server_ready = threading.Event()
+
+        def capture_server(
+            address: tuple[str, int], handler: type
+        ) -> ThreadingHTTPServer:
+            server = original_server(address, handler)
+            servers.append(server)
+            server_ready.set()
+            return server
+
+        with patch("ai.ThreadingHTTPServer", side_effect=capture_server):
+            worker = threading.Thread(
+                target=ai.serve_web_app,
+                kwargs={"model": "test-model", "host": ai.DEFAULT_HOST, "port": 0},
+            )
+            worker.start()
+            try:
+                self.assertTrue(server_ready.wait(timeout=5))
+                server = servers[0]
+                connection = HTTPConnection(*server.server_address, timeout=5)
+
+                connection.request("GET", "/")
+                page_response = connection.getresponse()
+                self.assertEqual(page_response.status, 200)
+                self.assertIn(b"JARVIS", page_response.read())
+
+                connection.request("GET", "/favicon.ico")
+                favicon_response = connection.getresponse()
+                self.assertEqual(favicon_response.status, 204)
+                self.assertEqual(favicon_response.read(), b"")
+
+                request_body = json.dumps(
+                    {"prompt": "hello", "history": []}
+                )
+                connection.request(
+                    "POST",
+                    "/api/chat",
+                    body=request_body,
+                    headers={"Content-Type": "application/json"},
+                )
+                chat_response = connection.getresponse()
+                self.assertEqual(chat_response.status, 200)
+                self.assertEqual(
+                    json.loads(chat_response.read()),
+                    {"response": "Hello from Jarvis"},
+                )
+                mock_response.assert_called_once_with(
+                    "hello",
+                    model="test-model",
+                    host=ai.DEFAULT_HOST,
+                    history=[],
+                )
+
+                connection.request(
+                    "POST",
+                    "/api/chat/stream",
+                    body=request_body,
+                    headers={"Content-Type": "application/json"},
+                )
+                stream_response = connection.getresponse()
+                stream_data = stream_response.read()
+                self.assertEqual(stream_response.status, 200)
+                self.assertIn(b'"token": "Hello "', stream_data)
+                self.assertIn(b'"token": "streaming"', stream_data)
+                self.assertIn(b'"done":true', stream_data)
+                mock_response_chunks.assert_called_once_with(
+                    "hello",
+                    model="test-model",
+                    host=ai.DEFAULT_HOST,
+                    history=[],
+                )
+
+                class FakeRecognizer:
+                    def __init__(self, model: object, sample_rate: int) -> None:
+                        assert model is not None
+                        assert sample_rate == ai.VOICE_SAMPLE_RATE
+
+                    def AcceptWaveform(self, audio: bytes) -> bool:
+                        assert audio
+                        return True
+
+                    def FinalResult(self) -> str:
+                        return json.dumps({"text": "recognized words"})
+
+                vosk_stub = ModuleType("vosk")
+                setattr(vosk_stub, "Model", lambda path: path)
+                setattr(vosk_stub, "KaldiRecognizer", FakeRecognizer)
+                with (
+                    tempfile.TemporaryDirectory() as model_directory,
+                    patch.dict(os.environ, {"VOSK_MODEL_PATH": model_directory}),
+                    patch.dict("sys.modules", {"vosk": vosk_stub}),
+                ):
+                    audio = b"\x00\x00" * 1600
+                    connection.request(
+                        "POST",
+                        "/api/transcribe",
+                        body=audio,
+                        headers={
+                            "Content-Type": "application/octet-stream",
+                            "X-Audio-Sample-Rate": "16000",
+                        },
+                    )
+                    transcription_response = connection.getresponse()
+                    self.assertEqual(transcription_response.status, 200)
+                    self.assertEqual(
+                        json.loads(transcription_response.read()),
+                        {"text": "recognized words"},
+                    )
+                connection.close()
+            finally:
+                if servers:
+                    servers[0].shutdown()
+                    servers[0].server_close()
+                worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
+                mock_browser.assert_called_once()
 
 
 class VoiceTests(unittest.TestCase):

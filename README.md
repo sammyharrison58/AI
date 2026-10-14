@@ -3,8 +3,9 @@
 Jarvis is a local personal assistant powered by [Ollama](https://ollama.com/).
 Text chat needs no Python packages or paid API key. Optional offline voice
 commands use Vosk for speech recognition and the Windows speech engine for
-spoken replies. Prompts, audio transcription, and model replies stay on your
-computer.
+spoken replies. The browser interface records audio in the browser and
+transcribes it locally with Vosk. The Ollama chat server runs locally on your
+computer, and browser chat displays streamed tokens as they are generated.
 
 ## Windows setup
 
@@ -47,6 +48,30 @@ Start text chat:
 ```powershell
 .\.venv\Scripts\python.exe ai.py
 ```
+
+Start the interactive Jarvis page:
+
+```powershell
+.\.venv\Scripts\python.exe ai.py --web
+```
+
+Jarvis opens `http://127.0.0.1:8765` in your browser. Type a message or click
+the microphone and allow microphone access when prompted. Click the microphone
+again to stop recording and send your voice; transcription runs locally through
+the configured Vosk model. Install the optional voice dependencies and model
+described above to use microphone input. Typed chat remains available without
+them. Use `--port` to choose a different local port. The page and web server use
+only Python's standard library, so no frontend build is required. Browser chat
+streams generated text immediately; actual speed depends on the local model and
+hardware. For faster, shorter replies, pull Ollama's smaller model variant and
+launch Jarvis with it:
+
+```powershell
+ollama pull llama3.2:1b
+.\.venv\Scripts\python.exe ai.py --web --model llama3.2:1b
+```
+
+The smaller model may be less capable than `llama3.2`.
 
 Start push-to-talk voice chat:
 
