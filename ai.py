@@ -17,7 +17,10 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 import webbrowser
 
-DEFAULT_MODEL = "llama3.2"
+from computer_control import action_summary, execute_action, prepare_action
+from web_ui import PAGE
+
+DEFAULT_MODEL = "llama3.2:1b"
 DEFAULT_HOST = "http://localhost:11434"
 DEFAULT_VOSK_MODEL = Path("models/vosk-model-small-en-us-0.15")
 F_DRIVE_VOSK_MODEL = Path("F:/Ollama/speech/vosk-model-small-en-us-0.15")
@@ -25,7 +28,11 @@ VOICE_SAMPLE_RATE = 16_000
 VOICE_RECORD_SECONDS = 7
 SYSTEM_PROMPT = (
     "You are Jarvis, a helpful, capable personal AI assistant. "
-    "Be clear, practical, and honest about uncertainty."
+    "Be clear, practical, and honest about uncertainty. Computer control is "
+    "limited to a fixed allowlist and always requires the user's separate "
+    "approval; never claim an action happened unless the application confirms it. "
+    "Do not provide or execute arbitrary shell commands, administrator actions, "
+    "software installs, file deletion, or shutdown/restart."
 )
 
 
@@ -206,6 +213,7 @@ def ollama_response_chunks(
     model: str = DEFAULT_MODEL,
     host: str = DEFAULT_HOST,
     history: list[dict[str, str]] | None = None,
+    voice_mode: bool = False,
     timeout: float = 120.0,
 ) -> Iterable[str]:
     """Yield assistant text as Ollama generates it."""
@@ -213,13 +221,25 @@ def ollama_response_chunks(
     if parsed_host.scheme not in {"http", "https"} or not parsed_host.netloc:
         raise OllamaError(f"Invalid Ollama server URL: {host}")
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    system_prompt = SYSTEM_PROMPT
+    if voice_mode:
+        system_prompt += (
+            " Speak naturally and keep voice-conversation replies brief, "
+            "usually one or two sentences. Avoid lists unless asked."
+        )
+    messages = [{"role": "system", "content": system_prompt}]
     if history:
         messages.extend(history)
     messages.append({"role": "user", "content": prompt})
-    payload = json.dumps(
-        {"model": model, "messages": messages, "stream": True}
-    ).encode("utf-8")
+    payload_data: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+    }
+    if voice_mode:
+        payload_data["keep_alive"] = "10m"
+        payload_data["options"] = {"num_predict": 128}
+    payload = json.dumps(payload_data).encode("utf-8")
     request = Request(
         f"{host.rstrip('/')}/api/chat",
         data=payload,
@@ -353,13 +373,12 @@ def interactive_chat(*, model: str, host: str, voice: bool = False) -> int:
 
 def serve_web_app(*, model: str, host: str, port: int) -> int:
     """Serve the dependency-free browser chat interface."""
-    page_path = Path(__file__).with_name("web.html")
-    page = page_path.read_bytes()
+    page = PAGE.encode("utf-8")
     voice_model: Any | None = None
     voice_model_lock = threading.Lock()
 
     class JarvisRequestHandler(BaseHTTPRequestHandler):
-        def _send_json(self, status: int, payload: dict[str, str]) -> None:
+        def _send_json(self, status: int, payload: dict[str, object]) -> None:
             body = json.dumps(payload).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -369,7 +388,7 @@ def serve_web_app(*, model: str, host: str, port: int) -> int:
 
         def _read_chat_request(
             self,
-        ) -> tuple[str, list[dict[str, str]]] | None:
+        ) -> tuple[str, list[dict[str, str]], bool] | None:
             try:
                 content_length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -390,6 +409,7 @@ def serve_web_app(*, model: str, host: str, port: int) -> int:
 
             prompt = request_data.get("prompt")
             history = request_data.get("history", [])
+            voice_mode = request_data.get("voice_mode", False)
             if not isinstance(prompt, str) or not normalize_prompt(prompt):
                 self._send_json(400, {"error": "Enter a message for Jarvis."})
                 return None
@@ -401,7 +421,10 @@ def serve_web_app(*, model: str, host: str, port: int) -> int:
             ):
                 self._send_json(400, {"error": "Conversation history is invalid."})
                 return None
-            return normalize_prompt(prompt), history
+            if not isinstance(voice_mode, bool):
+                self._send_json(400, {"error": "Voice mode must be a boolean."})
+                return None
+            return normalize_prompt(prompt), history, voice_mode
 
         def _get_voice_model(self) -> Any:
             nonlocal voice_model
@@ -451,16 +474,22 @@ def serve_web_app(*, model: str, host: str, port: int) -> int:
             if self.path == "/api/transcribe":
                 self._transcribe_audio()
                 return
+            if self.path == "/api/action/prepare":
+                self._prepare_computer_action()
+                return
+            if self.path == "/api/action/execute":
+                self._execute_computer_action()
+                return
             if self.path not in {"/api/chat", "/api/chat/stream"}:
                 self.send_error(404)
                 return
             chat_request = self._read_chat_request()
             if chat_request is None:
                 return
-            prompt, history = chat_request
+            prompt, history, voice_mode = chat_request
 
             if self.path == "/api/chat/stream":
-                self._stream_chat_response(prompt, history)
+                self._stream_chat_response(prompt, history, voice_mode)
                 return
 
             try:
@@ -475,8 +504,61 @@ def serve_web_app(*, model: str, host: str, port: int) -> int:
                 return
             self._send_json(200, {"response": answer})
 
+        def _read_action_request(self) -> dict[str, object] | None:
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._send_json(400, {"error": "Invalid request length."})
+                return None
+            if content_length <= 0 or content_length > 1_000_000:
+                self._send_json(400, {"error": "Invalid request size."})
+                return None
+            try:
+                request_data = json.loads(self.rfile.read(content_length))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"error": "Request body must be valid JSON."})
+                return None
+            if not isinstance(request_data, dict):
+                self._send_json(400, {"error": "Request body must be an object."})
+                return None
+            return request_data
+
+        def _prepare_computer_action(self) -> None:
+            request_data = self._read_action_request()
+            if request_data is None:
+                return
+            prompt = request_data.get("prompt")
+            if not isinstance(prompt, str) or len(prompt) > 20_000:
+                self._send_json(400, {"error": "Computer-action request is invalid."})
+                return
+            try:
+                action = prepare_action(prompt)
+                if action is None:
+                    self._send_json(200, {"action": None})
+                    return
+                self._send_json(
+                    200, {"action": action, "summary": action_summary(action)}
+                )
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+
+        def _execute_computer_action(self) -> None:
+            request_data = self._read_action_request()
+            if request_data is None:
+                return
+            action = request_data.get("action")
+            try:
+                message = execute_action(action)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            except (OSError, RuntimeError, TimeoutError) as exc:
+                self._send_json(500, {"error": str(exc)})
+                return
+            self._send_json(200, {"message": message})
+
         def _stream_chat_response(
-            self, prompt: str, history: list[dict[str, str]]
+            self, prompt: str, history: list[dict[str, str]], voice_mode: bool
         ) -> None:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -485,7 +567,11 @@ def serve_web_app(*, model: str, host: str, port: int) -> int:
             self.end_headers()
             try:
                 for chunk in ollama_response_chunks(
-                    prompt, model=model, host=host, history=history
+                    prompt,
+                    model=model,
+                    host=host,
+                    history=history,
+                    voice_mode=voice_mode,
                 ):
                     event = json.dumps({"token": chunk}, ensure_ascii=False)
                     self.wfile.write(f"data: {event}\n\n".encode("utf-8"))
@@ -494,8 +580,13 @@ def serve_web_app(*, model: str, host: str, port: int) -> int:
                 self.wfile.flush()
             except OllamaError as exc:
                 event = json.dumps({"error": str(exc)}, ensure_ascii=False)
-                self.wfile.write(f"data: {event}\n\n".encode("utf-8"))
-                self.wfile.flush()
+                try:
+                    self.wfile.write(f"data: {event}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                    pass
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                return
             self.close_connection = True
 
         def _transcribe_audio(self) -> None:

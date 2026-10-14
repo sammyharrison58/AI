@@ -19,26 +19,26 @@ $env:OLLAMA_MODELS = 'F:\Ollama\models'
 [Environment]::SetEnvironmentVariable('OLLAMA_MODELS', $env:OLLAMA_MODELS, 'User')
 irm https://ollama.com/install.ps1 | iex
 Start-Process -FilePath 'F:\Ollama\app\ollama.exe' -ArgumentList 'serve' -WindowStyle Hidden
-ollama pull llama3.2
+ollama pull llama3.2:1b
 ```
 
-If using the virtual environment in this repository, install the optional voice
-dependencies:
+If using the virtual environment in this repository, install the voice and
+computer-control dependencies:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Download and unpack the small English Vosk speech model onto F:, then configure
-its path for the current PowerShell session:
+Download and unpack the higher-accuracy English Vosk model onto F:, then
+configure its path for the current PowerShell session:
 
 ```powershell
 New-Item -ItemType Directory -Force F:\Ollama\speech | Out-Null
 Invoke-WebRequest `
-  -Uri https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip `
+  -Uri https://alphacephei.com/vosk/models/vosk-model-en-us-0.22-lgraph.zip `
   -OutFile F:\Ollama\vosk-model.zip
 Expand-Archive F:\Ollama\vosk-model.zip -DestinationPath F:\Ollama\speech -Force
-$env:VOSK_MODEL_PATH = 'F:\Ollama\speech\vosk-model-small-en-us-0.15'
+$env:VOSK_MODEL_PATH = 'F:\Ollama\speech\vosk-model-en-us-0.22-lgraph'
 [Environment]::SetEnvironmentVariable('VOSK_MODEL_PATH', $env:VOSK_MODEL_PATH, 'User')
 Remove-Item F:\Ollama\vosk-model.zip
 ```
@@ -56,24 +56,48 @@ Start the interactive Jarvis page:
 ```
 
 Jarvis opens `http://127.0.0.1:8765` in your browser. Type a message or click
-the microphone and allow microphone access when prompted. Click the microphone
-again to stop recording and send your voice; transcription runs locally through
-the configured Vosk model. Install the optional voice dependencies and model
-described above to use microphone input. Typed chat remains available without
-them. Use `--port` to choose a different local port. The page and web server use
-only Python's standard library, so no frontend build is required. Browser chat
-streams generated text immediately; actual speed depends on the local model and
-hardware. For faster, shorter replies, pull Ollama's smaller model variant and
-launch Jarvis with it:
+the microphone and allow microphone access to start a hands-free voice call.
+Leave the mic open while you speak; Jarvis detects a pause, transcribes locally
+with Vosk, then speaks its response and listens again. Click the mic again to
+end the call. Install the optional voice dependencies and model described above
+to use microphone input. Typed chat remains available without them. Voice-call
+replies are spoken sentence-by-sentence while their text continues streaming to
+the page. Browser speech uses an available English system voice; quality varies
+by browser and installed voices.
+
+Use `--port` to choose a different local port. The page and web server use only
+Python's standard library, and the page is defined in `web_ui.py` rather than a
+separate HTML file, so no frontend build is required. The default is the faster
+`llama3.2:1b` model. For more capable, potentially slower replies, pull and
+select the larger model:
 
 ```powershell
-ollama pull llama3.2:1b
-.\.venv\Scripts\python.exe ai.py --web --model llama3.2:1b
+ollama pull llama3.2:latest
+.\.venv\Scripts\python.exe ai.py --web --model llama3.2:latest
 ```
 
-The smaller model may be less capable than `llama3.2`.
+The 1B model may be less capable than `llama3.2:latest`.
 
-Start push-to-talk voice chat:
+### Computer actions and safety limits
+
+Jarvis can prepare a small set of local actions. It always shows a confirmation
+card with the exact action before changing anything; canceling the card does
+nothing. Supported requests include:
+
+- Open Calculator, Notepad, Paint, or File Explorer.
+- Open the Desktop, Documents, or Downloads folder.
+- Open an HTTP/HTTPS web address.
+- Create a `.txt` or `.md` file, up to 20,000 characters, in
+  `Documents\Jarvis` (an existing file is explicitly marked for replacement).
+- Set system volume or display brightness to an explicit percentage from 0 to
+  100. Volume control uses `pycaw`; brightness requires
+  a Windows display that supports the standard monitor control interface.
+
+Arbitrary shell commands, administrator actions, software installation, file
+deletion, and shutdown/restart are not supported. Computer actions require an
+approval click in the browser; voice recognition alone never approves them.
+
+Start terminal push-to-talk voice chat:
 
 ```powershell
 .\.venv\Scripts\python.exe ai.py --voice

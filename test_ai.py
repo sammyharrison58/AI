@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from urllib.error import URLError
 
 import ai
+import computer_control
 
 
 def make_sounddevice_stub() -> tuple[ModuleType, type[Exception]]:
@@ -69,6 +70,23 @@ class OllamaResponseTests(unittest.TestCase):
         payload = json.loads(mock_urlopen.call_args.args[0].data)
         self.assertTrue(payload["stream"])
 
+    @patch("ai.urlopen")
+    def test_voice_stream_uses_short_replies_and_keeps_model_loaded(
+        self, mock_urlopen: MagicMock
+    ) -> None:
+        response = MagicMock()
+        response.__enter__.return_value.__iter__.return_value = iter(
+            [b'{"message":{"content":"Hi."},"done":true}\n']
+        )
+        mock_urlopen.return_value = response
+
+        list(ai.ollama_response_chunks("hello", voice_mode=True))
+
+        payload = json.loads(mock_urlopen.call_args.args[0].data)
+        self.assertEqual(payload["keep_alive"], "10m")
+        self.assertEqual(payload["options"], {"num_predict": 128})
+        self.assertIn("keep voice-conversation replies brief", payload["messages"][0]["content"])
+
     @patch("ai.urlopen", side_effect=URLError("connection refused"))
     def test_connection_failure_is_reported(self, mock_urlopen: MagicMock) -> None:
         with self.assertRaisesRegex(ai.OllamaError, "Could not reach Ollama"):
@@ -85,6 +103,79 @@ class OllamaResponseTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ai.OllamaError, "no assistant message"):
             ai.ollama_response("hello")
+
+
+class ComputerControlTests(unittest.TestCase):
+    def test_prepare_recognizes_only_allowlisted_apps(self) -> None:
+        action = computer_control.prepare_action("Please open Calculator")
+
+        self.assertEqual(action, {"kind": "launch_app", "app": "calculator"})
+        self.assertEqual(
+            computer_control.prepare_action("Jarvis, could you open Calculator?"),
+            {"kind": "launch_app", "app": "calculator"},
+        )
+        self.assertIsNone(computer_control.prepare_action("open powershell"))
+
+    def test_action_validation_rejects_unlisted_apps_and_commands(self) -> None:
+        with self.assertRaisesRegex(ValueError, "allowed-app list"):
+            computer_control.validate_action(
+                {"kind": "launch_app", "app": "powershell"}
+            )
+        with self.assertRaisesRegex(ValueError, "not supported"):
+            computer_control.validate_action(
+                {"kind": "run_command", "command": "whoami"}
+            )
+
+    def test_file_creation_is_limited_to_jarvis_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = computer_control.Path(directory) / "Jarvis"
+            action = {
+                "kind": "write_file",
+                "filename": "notes.txt",
+                "content": "test content",
+                "overwrite": False,
+            }
+            with patch.object(computer_control, "WORKSPACE", workspace):
+                result = computer_control.execute_action(action)
+                self.assertEqual(
+                    (workspace / "notes.txt").read_text(encoding="utf-8"),
+                    "test content",
+                )
+            self.assertIn("notes.txt", result)
+
+    def test_editing_existing_workspace_file_requires_replace_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = computer_control.Path(directory)
+            (workspace / "notes.txt").write_text("old", encoding="utf-8")
+            with patch.object(computer_control, "WORKSPACE", workspace):
+                action = computer_control.prepare_action(
+                    "edit file named notes.txt containing updated"
+                )
+                self.assertEqual(action["overwrite"], True)
+                self.assertIn("Replace notes.txt", computer_control.action_summary(action))
+                computer_control.execute_action(action)
+            self.assertEqual(
+                (workspace / "notes.txt").read_text(encoding="utf-8"), "updated"
+            )
+
+    def test_file_validation_rejects_path_traversal(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Only short"):
+            computer_control.validate_action(
+                {
+                    "kind": "write_file",
+                    "filename": "..\\outside.txt",
+                    "content": "no",
+                    "overwrite": False,
+                }
+            )
+
+    def test_setting_values_are_bounded(self) -> None:
+        action = computer_control.prepare_action("set brightness to 60%")
+        self.assertEqual(
+            action, {"kind": "set_brightness", "value": 60}
+        )
+        with self.assertRaisesRegex(ValueError, "between 0 and 100"):
+            computer_control.prepare_action("set volume to 200%")
 
 
 class CommandLineTests(unittest.TestCase):
@@ -134,7 +225,10 @@ class CommandLineTests(unittest.TestCase):
 class WebInterfaceTests(unittest.TestCase):
     @patch(
         "ai.ollama_response_chunks",
-        return_value=iter(["Hello ", "streaming"]),
+        side_effect=[
+            iter(["Hello ", "streaming"]),
+            iter(["Hey there."]),
+        ],
     )
     @patch("ai.ollama_response", return_value="Hello from Jarvis")
     @patch("ai.webbrowser.open", return_value=True)
@@ -170,12 +264,40 @@ class WebInterfaceTests(unittest.TestCase):
                 connection.request("GET", "/")
                 page_response = connection.getresponse()
                 self.assertEqual(page_response.status, 200)
-                self.assertIn(b"JARVIS", page_response.read())
+                self.assertEqual(page_response.read(), ai.PAGE.encode("utf-8"))
 
                 connection.request("GET", "/favicon.ico")
                 favicon_response = connection.getresponse()
                 self.assertEqual(favicon_response.status, 204)
                 self.assertEqual(favicon_response.read(), b"")
+
+                connection.request(
+                    "POST",
+                    "/api/action/prepare",
+                    body=json.dumps({"prompt": "open calculator"}),
+                    headers={"Content-Type": "application/json"},
+                )
+                action_response = connection.getresponse()
+                action_payload = json.loads(action_response.read())
+                self.assertEqual(action_response.status, 200)
+                self.assertEqual(
+                    action_payload["action"],
+                    {"kind": "launch_app", "app": "calculator"},
+                )
+                self.assertIn("Open calculator", action_payload["summary"])
+                with patch("ai.execute_action", return_value="Opened calculator."):
+                    connection.request(
+                        "POST",
+                        "/api/action/execute",
+                        body=json.dumps({"action": action_payload["action"]}),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    execution_response = connection.getresponse()
+                    self.assertEqual(execution_response.status, 200)
+                    self.assertEqual(
+                        json.loads(execution_response.read()),
+                        {"message": "Opened calculator."},
+                    )
 
                 request_body = json.dumps(
                     {"prompt": "hello", "history": []}
@@ -211,11 +333,29 @@ class WebInterfaceTests(unittest.TestCase):
                 self.assertIn(b'"token": "Hello "', stream_data)
                 self.assertIn(b'"token": "streaming"', stream_data)
                 self.assertIn(b'"done":true', stream_data)
-                mock_response_chunks.assert_called_once_with(
+                mock_response_chunks.assert_any_call(
                     "hello",
                     model="test-model",
                     host=ai.DEFAULT_HOST,
                     history=[],
+                    voice_mode=False,
+                )
+                connection.request(
+                    "POST",
+                    "/api/chat/stream",
+                    body=json.dumps(
+                        {"prompt": "hi", "history": [], "voice_mode": True}
+                    ),
+                    headers={"Content-Type": "application/json"},
+                )
+                voice_stream_response = connection.getresponse()
+                voice_stream_response.read()
+                mock_response_chunks.assert_any_call(
+                    "hi",
+                    model="test-model",
+                    host=ai.DEFAULT_HOST,
+                    history=[],
+                    voice_mode=True,
                 )
 
                 class FakeRecognizer:

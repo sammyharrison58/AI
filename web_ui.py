@@ -1,4 +1,6 @@
-<!doctype html>
+"""Python source for Jarvis's browser interface."""
+
+PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -68,6 +70,13 @@
     .message { max-width: min(88%, 650px); padding: 13px 16px; border: 1px solid #ffffff12; border-radius: 17px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
     .message.user { align-self: flex-end; border-color: #56caff35; background: #18304a; }
     .message.assistant { align-self: flex-start; background: #121a2a; }
+    .message.action-card { width: min(100%, 650px); border-color: #69d7ff55; }
+    .action-summary { margin: 0 0 10px; color: #dff7ff; }
+    .action-preview { max-height: 180px; overflow: auto; margin: 0 0 12px; padding: 10px; border-radius: 9px; background: #080d18; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .action-buttons { display: flex; gap: 8px; }
+    .action-buttons button { padding: 8px 12px; border: 1px solid #ffffff25; border-radius: 9px; background: #ffffff0d; color: #eef3ff; cursor: pointer; }
+    .action-buttons button:first-child { border-color: #56caff66; background: #177aaa; }
+    .action-buttons button:disabled { cursor: wait; opacity: .55; }
     .message.error { align-self: center; border-color: #ff718055; color: #ffb5bc; font-size: 13px; }
     .composer { width: 100%; padding: 0 0 28px; }
     .input-wrap { display: flex; align-items: flex-end; gap: 10px; padding: 10px; border: 1px solid #ffffff20; border-radius: 21px; background: #111827e8; box-shadow: 0 14px 45px #0005; }
@@ -77,7 +86,7 @@
     .icon-button:hover { border-color: #5ecfff80; background: #2f9bc526; color: #a6edff; }
     .icon-button:disabled { cursor: wait; opacity: .48; }
     .icon-button svg { width: 20px; height: 20px; }
-    #mic.recording { border-color: #ff718088; background: #c8364528; color: #ff9ba4; }
+    #mic.call-active { border-color: #ff718088; background: #c8364528; color: #ff9ba4; }
     #send { border-color: #4abef755; background: #177aaa; color: white; }
     #send:hover { background: #2197c9; }
     .footnote { margin: 12px 0 0; color: #71809b; font-size: 11px; text-align: center; }
@@ -117,8 +126,8 @@
             </svg>
           </button>
         </div>
-        <div class="status" id="status" role="status">Type a message or use the microphone.</div>
-        <p class="footnote">Powered by your local Ollama model · Enter to send</p>
+        <div class="status" id="status" role="status">Type a message or start a voice call.</div>
+        <p class="footnote">Voice replies speak while text streams. Can open approved apps, folders and URLs, manage text files in Documents\Jarvis, and adjust volume or brightness. Every action needs approval; shell, admin, delete, install and shutdown actions are blocked.</p>
       </form>
     </main>
   </div>
@@ -132,14 +141,29 @@
     const orb = document.querySelector("#orb");
     const history = [];
     let busy = false;
-    let recording = false;
+    let callActive = false;
     let audioStream;
     let audioContext;
     let audioSource;
     let audioProcessor;
     let muteGain;
-    let audioChunks = [];
-    let recordingTimer;
+    let preRollChunks = [];
+    let utteranceChunks = [];
+    let utteranceActive = false;
+    let lastVoiceAt = 0;
+    let utteranceStartedAt = 0;
+    let noiseLevel = 0;
+    let callStartedAt = 0;
+    let resumeListeningAt = 0;
+    let activeChatController;
+    let speechQueue = Promise.resolve();
+    let pendingSpeech = "";
+    let pendingActionResolver;
+
+    const silenceDuration = 650;
+    const maxUtteranceDuration = 15000;
+    const callWarmupDuration = 500;
+    const maxPreRollSamples = 9600;
 
     function addMessage(role, text, extraClass = "") {
       const message = document.createElement("div");
@@ -154,24 +178,130 @@
       busy = value;
       input.disabled = value;
       sendButton.disabled = value;
-      micButton.disabled = value;
-      orb.classList.toggle("listening", value);
+      micButton.disabled = value && !callActive;
+      orb.classList.toggle("listening", callActive && !busy);
     }
 
-    async function sendMessage(text) {
+    function queueSpeech(text) {
+      if (!text.trim()) return;
+      speechQueue = speechQueue.then(() => new Promise((resolve) => {
+        if (!callActive || !("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") {
+          resolve();
+          return;
+        }
+        const utterance = new SpeechSynthesisUtterance(text.trim());
+        utterance.rate = 0.96;
+        const voices = window.speechSynthesis.getVoices();
+        utterance.voice = voices.find((voice) => /^en[-_]/i.test(voice.lang) && /natural|neural|online/i.test(voice.name))
+          || voices.find((voice) => /^en[-_]/i.test(voice.lang))
+          || null;
+        utterance.onend = resolve;
+        utterance.onerror = resolve;
+        window.speechSynthesis.speak(utterance);
+      }));
+    }
+
+    function queueCompletedSentences(final = false) {
+      const complete = /[.!?](?:["')\]]*)\s+/;
+      let match;
+      while ((match = complete.exec(pendingSpeech))) {
+        const end = match.index + match[0].length;
+        queueSpeech(pendingSpeech.slice(0, end));
+        pendingSpeech = pendingSpeech.slice(end);
+      }
+      if (final && pendingSpeech.trim()) {
+        queueSpeech(pendingSpeech);
+        pendingSpeech = "";
+      }
+    }
+
+    function requestActionApproval(action, summary, bubble) {
+      return new Promise((resolve) => {
+        bubble.classList.add("action-card");
+        const description = document.createElement("p");
+        description.className = "action-summary";
+        description.textContent = `Approval required: ${summary}`;
+        bubble.append(description);
+        if (action.kind === "write_file") {
+          const preview = document.createElement("pre");
+          preview.className = "action-preview";
+          preview.textContent = action.content || "(empty file)";
+          bubble.append(preview);
+        }
+        const buttons = document.createElement("div");
+        buttons.className = "action-buttons";
+        const approve = document.createElement("button");
+        approve.type = "button";
+        approve.textContent = "Approve action";
+        const reject = document.createElement("button");
+        reject.type = "button";
+        reject.textContent = "Cancel";
+        let settled = false;
+        const finish = (approved) => {
+          if (settled) return;
+          settled = true;
+          approve.disabled = true;
+          reject.disabled = true;
+          pendingActionResolver = undefined;
+          const outcome = document.createElement("p");
+          outcome.textContent = approved ? "Approved. Applying…" : "Cancelled; nothing was changed.";
+          bubble.append(outcome);
+          resolve(approved);
+        };
+        approve.addEventListener("click", () => finish(true));
+        reject.addEventListener("click", () => finish(false));
+        buttons.append(approve, reject);
+        bubble.append(buttons);
+        pendingActionResolver = () => finish(false);
+      });
+    }
+
+    async function requestJson(url, body) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `Request failed (${response.status}).`);
+      return result;
+    }
+
+    async function sendMessage(text, voiceMode = false, alreadyBusy = false) {
       const prompt = text.trim();
-      if (!prompt || busy) return;
+      if (!prompt || (busy && !alreadyBusy)) return;
       addMessage("user", prompt);
       input.value = "";
       setBusy(true);
-      statusEl.textContent = "Jarvis is responding…";
+      statusEl.textContent = voiceMode ? "Jarvis is listening…" : "Jarvis is responding…";
       const answerBubble = addMessage("assistant", "");
       let answer = "";
+      const controller = new AbortController();
+      if (voiceMode) activeChatController = controller;
       try {
+        const prepared = await requestJson("/api/action/prepare", { prompt });
+        if (prepared.action) {
+          statusEl.textContent = "Waiting for your approval…";
+          const approved = await requestActionApproval(prepared.action, prepared.summary, answerBubble);
+          if (!approved) {
+            statusEl.textContent = "Action cancelled; nothing was changed.";
+            return;
+          }
+          const result = await requestJson("/api/action/execute", { action: prepared.action });
+          answerBubble.textContent = result.message;
+          history.push({ role: "user", content: prompt }, { role: "assistant", content: result.message });
+          if (voiceMode) {
+            queueSpeech(result.message);
+            await speechQueue;
+          }
+          statusEl.textContent = "Action complete.";
+          return;
+        }
         const response = await fetch("/api/chat/stream", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ prompt, history })
+          body: JSON.stringify({ prompt, history, voice_mode: voiceMode }),
+          signal: controller.signal
         });
         if (!response.ok || !response.body) {
           const data = await response.json();
@@ -196,6 +326,11 @@
                 answer += data.token;
                 answerBubble.textContent = answer;
                 answerBubble.scrollIntoView({ behavior: "smooth", block: "nearest" });
+                if (voiceMode) {
+                  pendingSpeech += data.token;
+                  queueCompletedSentences();
+                  if (pendingSpeech.trim()) statusEl.textContent = "Jarvis is speaking…";
+                }
               }
               if (data.done) finished = true;
             }
@@ -205,18 +340,23 @@
         }
         if (!answer) throw new Error("Jarvis returned an empty response.");
         history.push({ role: "user", content: prompt }, { role: "assistant", content: answer });
-        if ("speechSynthesis" in window && typeof SpeechSynthesisUtterance !== "undefined") {
-          window.speechSynthesis.cancel();
-          window.speechSynthesis.speak(new SpeechSynthesisUtterance(answer));
+        if (voiceMode) {
+          queueCompletedSentences(true);
+          await speechQueue;
+          resumeListeningAt = performance.now() + silenceDuration;
         }
-        statusEl.textContent = "Ready when you are.";
+        statusEl.textContent = callActive ? "Call active · listening for you…" : "Ready when you are.";
       } catch (error) {
-        answerBubble.classList.add("error");
-        answerBubble.textContent = error instanceof Error ? error.message : String(error);
-        statusEl.textContent = "Could not reach Jarvis.";
+        if (error.name !== "AbortError") {
+          answerBubble.classList.add("error");
+          answerBubble.textContent = error instanceof Error ? error.message : String(error);
+          statusEl.textContent = error instanceof Error ? error.message : String(error);
+        }
       } finally {
+        if (activeChatController === controller) activeChatController = undefined;
+        pendingSpeech = "";
         setBusy(false);
-        input.focus();
+        if (!callActive) input.focus();
       }
     }
 
@@ -233,7 +373,7 @@
 
     async function transcribeAudio(pcm) {
       try {
-        statusEl.textContent = "Transcribing your voice locally…";
+        statusEl.textContent = "I heard you · transcribing…";
         const response = await fetch("/api/transcribe", {
           method: "POST",
           headers: { "Content-Type": "application/octet-stream", "X-Audio-Sample-Rate": "16000" },
@@ -241,54 +381,45 @@
         });
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || `Transcription failed (${response.status}).`);
+        if (!callActive) return;
         if (!result.text) {
-          statusEl.textContent = "I didn’t catch that. Click the microphone and try again.";
+          setBusy(false);
+          statusEl.textContent = callActive ? "Call active · listening for you…" : "I didn’t catch that.";
           return;
         }
-        input.value = result.text;
-        await sendMessage(result.text);
+        setBusy(false);
+        await sendMessage(result.text, true);
       } catch (error) {
-        statusEl.textContent = error instanceof Error ? error.message : String(error);
+        setBusy(false);
+        if (callActive) {
+          statusEl.textContent = error instanceof Error ? error.message : String(error);
+        }
       } finally {
-        micButton.disabled = false;
-        input.disabled = false;
-        sendButton.disabled = false;
-        orb.classList.remove("listening");
-        input.focus();
+        if (!busy) micButton.disabled = false;
       }
     }
 
-    async function finishRecording() {
-      if (!recording) return;
-      recording = false;
-      clearTimeout(recordingTimer);
-      statusEl.textContent = "Finishing recording…";
-      micButton.classList.remove("recording");
-      micButton.setAttribute("aria-label", "Speak to Jarvis");
-      micButton.title = "Speak to Jarvis";
-      micButton.disabled = true;
-      audioProcessor?.disconnect();
-      audioSource?.disconnect();
-      muteGain?.disconnect();
-      audioStream?.getTracks().forEach((track) => track.stop());
-      audioStream = undefined;
-      audioProcessor = undefined;
-      audioSource = undefined;
-      muteGain = undefined;
+    async function finishUtterance() {
+      if (!utteranceActive || busy) return;
+      utteranceActive = false;
+      const chunks = utteranceChunks;
+      utteranceChunks = [];
       const context = audioContext;
-      audioContext = undefined;
-
       try {
-        if (context && context.state !== "closed") await context.close();
-        const totalSamples = audioChunks.reduce((total, chunk) => total + chunk.length, 0);
-        if (!totalSamples) throw new Error("No microphone audio was captured. Check your microphone and try again.");
+        const totalSamples = chunks.reduce((total, chunk) => total + chunk.length, 0);
+        if (!totalSamples || !context) return;
         const samples = new Float32Array(totalSamples);
         let offset = 0;
-        for (const chunk of audioChunks) {
+        for (const chunk of chunks) {
           samples.set(chunk, offset);
           offset += chunk.length;
         }
-        audioChunks = [];
+        let mean = 0;
+        let peak = 0;
+        for (const sample of samples) mean += sample;
+        mean /= samples.length;
+        for (const sample of samples) peak = Math.max(peak, Math.abs(sample - mean));
+        const gain = peak > 0.01 ? Math.min(4, 0.7 / peak) : 1;
         const ratio = context.sampleRate / 16000;
         const sampleCount = Math.floor(samples.length / ratio);
         if (!sampleCount) throw new Error("The recording was too short. Please try again.");
@@ -298,25 +429,18 @@
           const low = Math.floor(sourceIndex);
           const fraction = sourceIndex - low;
           const sample = samples[low] * (1 - fraction) + samples[Math.min(low + 1, samples.length - 1)] * fraction;
-          pcm[i] = Math.max(-1, Math.min(1, sample)) * 32767;
+          const normalized = (sample - mean) * gain;
+          pcm[i] = Math.max(-1, Math.min(1, normalized)) * 32767;
         }
+        setBusy(true);
         await transcribeAudio(pcm);
       } catch (error) {
+        setBusy(false);
         statusEl.textContent = error instanceof Error ? error.message : String(error);
-        micButton.disabled = false;
-        input.disabled = false;
-        sendButton.disabled = false;
-      } finally {
-        orb.classList.remove("listening");
       }
     }
 
-    micButton.addEventListener("click", async () => {
-      if (recording) {
-        await finishRecording();
-        return;
-      }
-      if (busy) return;
+    async function startCall() {
       if (!navigator.mediaDevices?.getUserMedia || typeof AudioContext === "undefined") {
         statusEl.textContent = "This browser cannot capture microphone audio. Try a recent version of Chrome or Edge.";
         return;
@@ -334,20 +458,66 @@
         muteGain = audioContext.createGain();
         muteGain.gain.value = 0;
         audioProcessor.onaudioprocess = (event) => {
-          if (recording) audioChunks.push(event.inputBuffer.getChannelData(0).slice());
+          if (!callActive || busy) return;
+          if (performance.now() < resumeListeningAt) {
+            preRollChunks = [];
+            return;
+          }
+          const frame = event.inputBuffer.getChannelData(0).slice();
+          let energy = 0;
+          for (let i = 0; i < frame.length; i++) energy += frame[i] * frame[i];
+          const level = Math.sqrt(energy / frame.length);
+          if (!utteranceActive) {
+            preRollChunks.push(frame);
+            let preRollSamples = preRollChunks.reduce((total, chunk) => total + chunk.length, 0);
+            while (preRollSamples > maxPreRollSamples && preRollChunks.length) {
+              preRollSamples -= preRollChunks.shift().length;
+            }
+            if (performance.now() - callStartedAt < callWarmupDuration) {
+              noiseLevel = noiseLevel * 0.8 + level * 0.2;
+              return;
+            }
+            const speechThreshold = Math.max(0.012, noiseLevel * 2.2);
+            if (level >= speechThreshold) {
+              utteranceActive = true;
+              utteranceChunks = [...preRollChunks];
+              preRollChunks = [];
+              lastVoiceAt = performance.now();
+              utteranceStartedAt = lastVoiceAt;
+              statusEl.textContent = "I hear you…";
+            } else {
+              noiseLevel = noiseLevel * 0.95 + level * 0.05;
+            }
+            return;
+          }
+
+          utteranceChunks.push(frame);
+          const silenceThreshold = Math.max(0.008, noiseLevel * 1.5);
+          if (level >= silenceThreshold) {
+            lastVoiceAt = performance.now();
+          } else if (
+            performance.now() - lastVoiceAt >= silenceDuration
+            || performance.now() - utteranceStartedAt >= maxUtteranceDuration
+          ) {
+            void finishUtterance();
+          }
         };
         audioSource.connect(audioProcessor);
         audioProcessor.connect(muteGain);
         muteGain.connect(audioContext.destination);
-        audioChunks = [];
-        recording = true;
+        preRollChunks = [];
+        utteranceChunks = [];
+        utteranceActive = false;
+        noiseLevel = 0;
+        callStartedAt = performance.now();
+        resumeListeningAt = 0;
+        callActive = true;
         micButton.disabled = false;
-        micButton.classList.add("recording");
-        micButton.setAttribute("aria-label", "Stop recording and send");
-        micButton.title = "Stop recording and send";
+        micButton.classList.add("call-active");
+        micButton.setAttribute("aria-label", "End voice call");
+        micButton.title = "End voice call";
         orb.classList.add("listening");
-        statusEl.textContent = "Recording… click the microphone again when you’re done.";
-        recordingTimer = setTimeout(finishRecording, 30000);
+        statusEl.textContent = "Call active · listening for you…";
       } catch (error) {
         audioStream?.getTracks().forEach((track) => track.stop());
         audioStream = undefined;
@@ -361,11 +531,46 @@
             ? "No microphone was found. Connect or enable a microphone and try again."
             : `Could not start microphone recording: ${message}`;
         orb.classList.remove("listening");
-        micButton.classList.remove("recording");
+        micButton.classList.remove("call-active");
         micButton.setAttribute("aria-label", "Speak to Jarvis");
         micButton.title = "Speak to Jarvis";
+      }
+    }
+
+    async function endCall() {
+      callActive = false;
+      pendingActionResolver?.();
+      utteranceActive = false;
+      preRollChunks = [];
+      utteranceChunks = [];
+      activeChatController?.abort();
+      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+      audioProcessor?.disconnect();
+      audioSource?.disconnect();
+      muteGain?.disconnect();
+      audioStream?.getTracks().forEach((track) => track.stop());
+      audioStream = undefined;
+      audioProcessor = undefined;
+      audioSource = undefined;
+      muteGain = undefined;
+      const context = audioContext;
+      audioContext = undefined;
+      if (context && context.state !== "closed") await context.close();
+      micButton.classList.remove("call-active");
+      micButton.setAttribute("aria-label", "Start voice call");
+      micButton.title = "Start voice call";
+      orb.classList.remove("listening");
+      statusEl.textContent = "Call ended · type a message or start another call.";
+    }
+
+    micButton.addEventListener("click", () => {
+      if (callActive) {
+        void endCall();
+      } else if (!busy) {
+        void startCall();
       }
     });
   </script>
 </body>
 </html>
+"""
